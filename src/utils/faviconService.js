@@ -61,43 +61,36 @@ const extractDomainInfo = (url) => {
   }
 };
 
-// 验证图像URL是否有效 (优化版本)
+// 验证图像URL是否有效 (基于HTTP响应代码)
 const verifyImageUrl = (url, timeout = IMAGE_CONFIG.VERIFICATION_TIMEOUT) => {
   return new Promise((resolve) => {
-    const img = new Image();
-    let resolved = false;
-
-    const cleanup = (result) => {
-      if (!resolved) {
-        resolved = true;
-        img.onload = null;
-        img.onerror = null;
-        img.src = '';
-        resolve(result);
-      }
-    };
-
-    img.onload = () => {
-      // 检查图像是否有实际内容
-      cleanup(img.width > 0 && img.height > 0);
-    };
-
-    img.onerror = () => cleanup(false);
-
+    // 使用AbortController来处理超时
+    const controller = new AbortController();
+    const signal = controller.signal;
+    
     // 设置超时
-    const timeoutId = setTimeout(() => cleanup(false), timeout);
-
-    try {
-      // 添加随机参数避免缓存问题
-      const separator = url.includes('?') ? '&' : '?';
-      img.src = `${url}${separator}_=${Date.now()}`;
-    } catch (error) {
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+      resolve(false);
+    }, timeout);
+    
+    fetch(url, {
+      method: 'HEAD', // 只获取头信息，不下载实际内容
+      signal,
+      cache: 'no-store', // 避免缓存问题
+      credentials: 'omit' // 不发送凭证
+    })
+    .then(response => {
       clearTimeout(timeoutId);
-      cleanup(false);
-    }
+      // 检查HTTP响应代码，2xx表示成功
+      resolve(response.ok);
+    })
+    .catch(() => {
+      clearTimeout(timeoutId);
+      resolve(false);
+    });
   });
 };
-
 // 从本地存储中获取缓存的图标 (优化版本)
 const getCachedFavicon = (url) => {
   try {
@@ -260,6 +253,7 @@ const getFaviconFromPublicServices = async (url) => {
 };
 
 // 直接从网站获取favicon (优化版本)
+// 直接从网站获取favicon (增强版本)
 const getFaviconDirectlyFromWebsite = async (url) => {
   try {
     const domainInfo = extractDomainInfo(url);
@@ -267,6 +261,79 @@ const getFaviconDirectlyFromWebsite = async (url) => {
 
     const { origin } = domainInfo;
 
+    // 1. 首先尝试从HTML中提取favicon链接
+    try {
+      // 获取网页HTML内容
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Accept': 'text/html',
+        },
+        credentials: 'omit',
+        cache: 'no-store',
+        timeout: 5000
+      });
+      
+      if (response.ok) {
+        const html = await response.text();
+        
+        // 创建DOM解析器
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        
+        // 按优先级排序的链接选择器数组
+        const selectors = [
+          // Apple Touch Icons (通常质量最高)
+          'link[rel="apple-touch-icon-precomposed"][href]',
+          'link[rel="apple-touch-icon"][href]',
+          
+          // 标准图标 - 按大小排序
+          'link[rel="icon"][sizes="192x192"][href]',
+          'link[rel="icon"][sizes="128x128"][href]',
+          'link[rel="icon"][sizes="96x96"][href]',
+          'link[rel="icon"][sizes="64x64"][href]',
+          'link[rel="icon"][sizes="32x32"][href]',
+          'link[rel="shortcut icon"][href]',
+          'link[rel="icon"][href]',
+          
+          // 其他类型的图标
+          'link[rel="fluid-icon"][href]',
+          'link[rel="mask-icon"][href]',
+          
+          // SVG图标（可扩展矢量图形，质量通常很好）
+          'link[rel="icon"][type="image/svg+xml"][href]',
+        ];
+        
+        // 遍历选择器，寻找匹配的元素
+        for (const selector of selectors) {
+          const linkElement = doc.querySelector(selector);
+          if (linkElement && linkElement.getAttribute('href')) {
+            let iconUrl = linkElement.getAttribute('href');
+            
+            // 处理相对URL
+            if (iconUrl.startsWith('/')) {
+              iconUrl = `${origin}${iconUrl}`;
+            } else if (!iconUrl.startsWith('http')) {
+              // 处理相对路径（不以/开头）
+              const urlObj = new URL(url);
+              const pathWithoutFilename = urlObj.pathname.substring(0, urlObj.pathname.lastIndexOf('/') + 1);
+              iconUrl = `${origin}${pathWithoutFilename}${iconUrl}`;
+            }
+            
+            // 验证找到的图标是否可访问
+            const isValid = await verifyImageUrl(iconUrl);
+            if (isValid) {
+              return iconUrl;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('从HTML提取图标失败:', error);
+      // 如果提取失败，继续尝试常见路径
+    }
+
+    // 2. 如果从HTML提取失败，尝试常见的图标路径
     // 为不同的可能位置生成图标URL (按优先级排序)
     const iconPaths = [
       // 最常见的标准位置
